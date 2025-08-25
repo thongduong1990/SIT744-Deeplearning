@@ -1,21 +1,13 @@
 '''
 Code for applying Layca on SGD, Adam, RMSprop and Adagrad.
-Source: keras' implementation of the original optimization methods.
+Updated for Keras 3 compatibility.
 '''
 
+import keras
 from keras.optimizers import Optimizer
-import keras.backend as K
-from keras.legacy import interfaces
-
+import keras.ops as ops
 import tensorflow as tf
-
-from keras.optimizers import Optimizer
-import keras.backend as K
-from keras.legacy import interfaces
-
 import numpy as np
-
-import tensorflow as tf
 
 def layca(p, step, lr):
     '''
@@ -26,17 +18,17 @@ def layca(p, step, lr):
     '''
     if 'kernel' in p.name: # only kernels are optimized when using Layca (and not biases and batchnorm parameters)
         # projecting step on tangent space of sphere -> orthogonal to the parameters p
-        initial_norm = tf.norm(p)
-        step = step - (K.sum(step * p))* p / initial_norm**2
+        initial_norm = ops.norm(p)
+        step = step - (ops.sum(step * p))* p / initial_norm**2
 
         # normalizing step size
-        step = tf.cond(tf.norm(step)<= K.epsilon(), lambda: tf.zeros_like(step), lambda: step/ (tf.norm(step)) * initial_norm)
+        step = ops.cond(ops.norm(step)<= keras.backend.epsilon(), lambda: ops.zeros_like(step), lambda: step/ (ops.norm(step)) * initial_norm)
         
         # applying step
         new_p =  p - lr * step
 
         # recovering norm of the parameter from before the update
-        new_p = new_p / tf.norm(new_p) * initial_norm
+        new_p = new_p / ops.norm(new_p) * initial_norm
         return new_p
     else:
         return p 
@@ -46,328 +38,315 @@ class SGD(Optimizer):
     Includes support for momentum,
     learning rate decay, and Nesterov momentum.
     # Arguments
-        lr: float >= 0. Learning rate.
+        learning_rate: float >= 0. Learning rate.
         momentum: float >= 0. Parameter that accelerates SGD
             in the relevant direction and dampens oscillations.
-        decay: float >= 0. Learning rate decay over each update.
         nesterov: boolean. Whether to apply Nesterov momentum.
         multipliers: dictionary with as keys layer names and values the corresponding layer-wise learning rate multiplier
         adam_like_momentum: boolean, if a momentum scheme similar to adam should be used
         layca: boolean, wether to apply layca or not
     """
 
-    def __init__(self, lr=0.01, momentum=0., decay=0.,
+    def __init__(self, learning_rate=0.01, momentum=0., 
                  nesterov=False, multipliers={'$ùµµ':1.}, adam_like_momentum = False, 
                  layca = False, normalized = False, effective_lr = False, **kwargs):
-        super().__init__(**kwargs)
-        with K.name_scope(self.__class__.__name__):
-            self.iterations = K.variable(0, dtype='int64', name='iterations')
-            self.lr = K.variable(lr, name='lr')
-            self.momentum = K.variable(momentum, name='momentum')
-            self.decay = K.variable(decay, name='decay')
-        self.initial_decay = decay
+        super().__init__(learning_rate=learning_rate, **kwargs)
+        self.momentum = momentum
         self.nesterov = nesterov
-        
         self.adam_like_momentum = adam_like_momentum
-        with K.name_scope(self.__class__.__name__):
-            for key,value in multipliers.items():
-                multipliers[key] = K.variable(value)
         self.multipliers = multipliers
         self.layca = layca
         self.normalized = normalized
         self.effective_lr = effective_lr
 
-    @interfaces.legacy_get_updates_support
-    def get_updates(self, loss, params):        
-        grads = self.get_gradients(loss, params)
-        self.updates = [K.update_add(self.iterations, 1)]
+    def build(self, var_list):
+        """Initialize optimizer variables."""
+        super().build(var_list)
+        if hasattr(self, "_built") and self._built:
+            return
+        self.momentums = []
+        for var in var_list:
+            self.momentums.append(
+                self.add_variable_from_reference(
+                    reference_variable=var, name="momentum"
+                )
+            )
 
-        lr = self.lr
-        if self.initial_decay > 0:
-            lr *= (1. / (1. + self.decay * K.cast(self.iterations,
-                                                  K.dtype(self.decay))))
-        # momentum
-        shapes = [K.int_shape(p) for p in params]
-        moments = [K.zeros(shape) for shape in shapes]
-        self.weights = [self.iterations] + moments
-        for p, g, m in zip(params, grads, moments):            
-            processed = False
-            for key in self.multipliers.keys():
-                if key+'/' in p.name and not processed: # based on the way keras names a layer's weights
-                    new_lr = lr * self.multipliers[key]
-                    processed = True
-            if not processed:
-                new_lr = lr
-            
-            if self.adam_like_momentum:
-                v =  (self.momentum * m) - (1. - self.momentum) * g
-                self.updates.append(K.update(m, v))
-                v = new_lr * v
-            else:
-                v = self.momentum * m - new_lr * g  # velocity
-                self.updates.append(K.update(m, v))
-             
-            if self.nesterov:
-                step =  self.momentum * v - new_lr * g
-            else:
-                step =  v
-            
-            if self.layca:
-                new_p = layca(p, -step, new_lr)
-            elif self.normalized: # normalized gradients
-                step = tf.cond(tf.norm(step)<= K.epsilon(), lambda: tf.zeros_like(step), lambda: step/ (tf.norm(step)))
-                new_p =  p + new_lr * step
-            elif self.effective_lr: # effective learning rate
-                new_p = p + step * tf.norm(p)**2
-            else:
-                new_p =  p + step
+    def update_step(self, gradient, variable, learning_rate):
+        """One step of SGD."""
+        learning_rate = ops.cast(learning_rate, variable.dtype)
+        gradient = ops.cast(gradient, variable.dtype)
+        
+        # Find the corresponding momentum variable
+        m = None
+        for i, var in enumerate(self.variables):
+            if var.name == variable.name:
+                if i < len(self.momentums):
+                    m = self.momentums[i]
+                break
+        
+        if m is None:
+            # Create momentum variable on the fly if not found
+            m = ops.zeros_like(variable)
+        
+        # Apply layer-wise learning rate multipliers
+        processed = False
+        for key in self.multipliers.keys():
+            if key+'/' in variable.name and not processed:
+                learning_rate = learning_rate * self.multipliers[key]
+                processed = True
+        
+        if self.adam_like_momentum:
+            v = (self.momentum * m) - (1. - self.momentum) * gradient
+            if m is not None and hasattr(m, 'assign'):
+                m.assign(v)
+            v = learning_rate * v
+        else:
+            v = self.momentum * m - learning_rate * gradient
+            if m is not None and hasattr(m, 'assign'):
+                m.assign(v)
+         
+        if self.nesterov:
+            step = self.momentum * v - learning_rate * gradient
+        else:
+            step = v
+        
+        if self.layca:
+            new_p = layca(variable, -step, learning_rate)
+        elif self.normalized:
+            step = ops.cond(ops.norm(step)<= keras.backend.epsilon(), 
+                          lambda: ops.zeros_like(step), 
+                          lambda: step/ (ops.norm(step)))
+            new_p = variable + learning_rate * step
+        elif self.effective_lr:
+            new_p = variable + step * ops.norm(variable)**2
+        else:
+            new_p = variable + step
 
-            # Apply constraints.
-            if getattr(p, 'constraint', None) is not None:
-                new_p = p.constraint(new_p)
-
-            self.updates.append(K.update(p, new_p))
-        return self.updates
+        self.assign(variable, new_p)
 
     def get_config(self):
-        config = {'lr': float(K.get_value(self.lr)),
-                  'momentum': float(K.get_value(self.momentum)),
-                  'decay': float(K.get_value(self.decay)),
-                  'nesterov': self.nesterov,
-                  'adam_like_momentum':self.adam_like_momentum,
-                  'multipliers':self.multipliers,
-                  'layca':self.layca,
-                  'normalized': self.normalized,
-                  'effective_lr': self.effective_lr}
-        base_config = super().get_config()
-        return dict(list(base_config.items()) + list(config.items()))
+        config = super().get_config()
+        config.update({
+            "momentum": self.momentum,
+            "nesterov": self.nesterov,
+            "adam_like_momentum": self.adam_like_momentum,
+            "multipliers": self.multipliers,
+            "layca": self.layca,
+            "normalized": self.normalized,
+            "effective_lr": self.effective_lr,
+        })
+        return config
 
 class RMSprop(Optimizer):
-    """RMSProp optimizer.
-    It is recommended to leave the parameters of this optimizer
-    at their default values
-    (except the learning rate, which can be freely tuned).
-    This optimizer is usually a good choice for recurrent
-    neural networks.
-    # Arguments
-        lr: float >= 0. Learning rate.
-        rho: float >= 0.
-        epsilon: float >= 0. Fuzz factor. If `None`, defaults to `K.epsilon()`.
-        decay: float >= 0. Learning rate decay over each update.
-        layca: boolean, wether to apply layca or not
-    # References
-        - [rmsprop: Divide the gradient by a running average of its recent magnitude](http://www.cs.toronto.edu/~tijmen/csc321/slides/lecture_slides_lec6.pdf)
-    """
+    """RMSProp optimizer."""
 
-    def __init__(self, lr=0.001, rho=0.9, epsilon=None, decay=0., layca = False,
-                 **kwargs):
-        super(RMSprop, self).__init__(**kwargs)
-        with K.name_scope(self.__class__.__name__):
-            self.lr = K.variable(lr, name='lr')
-            self.rho = K.variable(rho, name='rho')
-            self.decay = K.variable(decay, name='decay')
-            self.iterations = K.variable(0, dtype='int64', name='iterations')
-        if epsilon is None:
-            epsilon = K.epsilon()
+    def __init__(self, learning_rate=0.001, rho=0.9, epsilon=1e-7, layca=False, **kwargs):
+        super().__init__(learning_rate=learning_rate, **kwargs)
+        self.rho = rho
         self.epsilon = epsilon
-        self.initial_decay = decay
-        
         self.layca = layca
 
-    @interfaces.legacy_get_updates_support
-    def get_updates(self, loss, params):        
-        grads = self.get_gradients(loss, params)
-        accumulators = [K.zeros(K.int_shape(p), dtype=K.dtype(p)) for p in params]
-        self.weights = accumulators
-        self.updates = [K.update_add(self.iterations, 1)]
+    def build(self, var_list):
+        """Initialize optimizer variables."""
+        super().build(var_list)
+        if hasattr(self, "_built") and self._built:
+            return
+        self.accumulators = []
+        for var in var_list:
+            self.accumulators.append(
+                self.add_variable_from_reference(
+                    reference_variable=var, name="accumulator"
+                )
+            )
 
-        lr = self.lr
-        if self.initial_decay > 0:
-            lr *= (1. / (1. + self.decay * K.cast(self.iterations,
-                                                  K.dtype(self.decay))))
-
-        for p, g, a in zip(params, grads, accumulators):
-            # update accumulator
-            new_a = self.rho * a + (1. - self.rho) * K.square(g)
-            self.updates.append(K.update(a, new_a))
-            #new_p = p - lr * g / (K.sqrt(new_a) + self.epsilon)
-            step = lr * g / (K.sqrt(new_a) + self.epsilon)
-            
-            if self.layca:
-                new_p = layca(p, step, lr)
-            else:
-                new_p =  p - step
-            
-            # Apply constraints.
-            if getattr(p, 'constraint', None) is not None:
-                new_p = p.constraint(new_p)
-
-            self.updates.append(K.update(p, new_p))
-        return self.updates
-
-    def get_config(self):
-        config = {'lr': float(K.get_value(self.lr)),
-                  'rho': float(K.get_value(self.rho)),
-                  'decay': float(K.get_value(self.decay)),
-                  'epsilon': self.epsilon,
-                  'layca':self.layca}
-        base_config = super(RMSprop, self).get_config()
-        return dict(list(base_config.items()) + list(config.items()))
-    
-class Adam(Optimizer):
-    """Adam optimizer.
-    Default parameters follow those provided in the original paper.
-    # Arguments
-        lr: float >= 0. Learning rate.
-        beta_1: float, 0 < beta < 1. Generally close to 1.
-        beta_2: float, 0 < beta < 1. Generally close to 1.
-        epsilon: float >= 0. Fuzz factor. If `None`, defaults to `K.epsilon()`.
-        decay: float >= 0. Learning rate decay over each update.
-        layca: boolean, wether to apply layca or not
-        amsgrad: boolean. Whether to apply the AMSGrad variant of this
-            algorithm from the paper "On the Convergence of Adam and
-            Beyond".
-    # References
-        - [Adam - A Method for Stochastic Optimization](http://arxiv.org/abs/1412.6980v8)
-        - [On the Convergence of Adam and Beyond](https://openreview.net/forum?id=ryQu7f-RZ)
-    """
-
-    def __init__(self, lr=0.001, beta_1=0.9, beta_2=0.999, layca = False,
-                 epsilon=None, decay=0., amsgrad=False, **kwargs):
-        super(Adam, self).__init__(**kwargs)
-        with K.name_scope(self.__class__.__name__):
-            self.iterations = K.variable(0, dtype='int64', name='iterations')
-            self.lr = K.variable(lr, name='lr')
-            self.beta_1 = K.variable(beta_1, name='beta_1')
-            self.beta_2 = K.variable(beta_2, name='beta_2')
-            self.decay = K.variable(decay, name='decay')
-        if epsilon is None:
-            epsilon = K.epsilon()
-        self.epsilon = epsilon
-        self.initial_decay = decay
-        self.amsgrad = amsgrad
+    def update_step(self, gradient, variable, learning_rate):
+        """One step of RMSprop."""
+        learning_rate = ops.cast(learning_rate, variable.dtype)
+        gradient = ops.cast(gradient, variable.dtype)
         
-        self.layca = layca
-    
-    @interfaces.legacy_get_updates_support
-    def get_updates(self, loss, params):
-        grads = self.get_gradients(loss, params)
-        self.updates = [K.update_add(self.iterations, 1)]
+        # Find the corresponding accumulator
+        a = None
+        for i, var in enumerate(self.variables):
+            if var.name == variable.name:
+                a = self.accumulators[i]
+                break
+        
+        if a is None:
+            a = ops.zeros_like(variable)
 
-        lr = self.lr
-        if self.initial_decay > 0:
-            lr *= (1. / (1. + self.decay * K.cast(self.iterations,
-                                                  K.dtype(self.decay))))
-
-        t = K.cast(self.iterations, K.floatx()) + 1
-        lr_t = lr * (K.sqrt(1. - K.pow(self.beta_2, t)) /
-                     (1. - K.pow(self.beta_1, t)))
-
-        ms = [K.zeros(K.int_shape(p), dtype=K.dtype(p)) for p in params]
-        vs = [K.zeros(K.int_shape(p), dtype=K.dtype(p)) for p in params]
-        if self.amsgrad:
-            vhats = [K.zeros(K.int_shape(p), dtype=K.dtype(p)) for p in params]
+        # Update accumulator
+        new_a = self.rho * a + (1. - self.rho) * ops.square(gradient)
+        self.assign(a, new_a)
+        
+        step = learning_rate * gradient / (ops.sqrt(new_a) + self.epsilon)
+        
+        if self.layca:
+            new_p = layca(variable, step, learning_rate)
         else:
-            vhats = [K.zeros((1,)) for _ in params]
-        self.weights = [self.iterations] + ms + vs + vhats
-
-        for p, g, m, v, vhat in zip(params, grads, ms, vs, vhats):
-            m_t = (self.beta_1 * m) + (1. - self.beta_1) * g
-            v_t = (self.beta_2 * v) + (1. - self.beta_2) * K.square(g)
-            if self.amsgrad:
-                vhat_t = K.maximum(vhat, v_t)
-                step = lr_t * m_t / (K.sqrt(vhat_t) + self.epsilon)
-                self.updates.append(K.update(vhat, vhat_t))
-            else:
-                step = lr_t * m_t / (K.sqrt(v_t) + self.epsilon)
-
-            self.updates.append(K.update(m, m_t))
-            self.updates.append(K.update(v, v_t))
-            
-            if self.layca:
-                new_p = layca(p, step, lr)
-            else:
-                new_p =  p - step
-
-            # Apply constraints.
-            if getattr(p, 'constraint', None) is not None:
-                new_p = p.constraint(new_p)
-
-            self.updates.append(K.update(p, new_p))
-        return self.updates
+            new_p = variable - step
+        
+        self.assign(variable, new_p)
 
     def get_config(self):
-        config = {'lr': float(K.get_value(self.lr)),
-                  'beta_1': float(K.get_value(self.beta_1)),
-                  'beta_2': float(K.get_value(self.beta_2)),
-                  'decay': float(K.get_value(self.decay)),
-                  'epsilon': self.epsilon,
-                  'amsgrad': self.amsgrad,
-                  'layca':self.layca}
-        base_config = super(Adam, self).get_config()
-        return dict(list(base_config.items()) + list(config.items()))
+        config = super().get_config()
+        config.update({
+            "rho": self.rho,
+            "epsilon": self.epsilon,
+            "layca": self.layca,
+        })
+        return config
+
+class Adam(Optimizer):
+    """Adam optimizer."""
+
+    def __init__(self, learning_rate=0.001, beta_1=0.9, beta_2=0.999, 
+                 epsilon=1e-7, layca=False, amsgrad=False, **kwargs):
+        super().__init__(learning_rate=learning_rate, **kwargs)
+        self.beta_1 = beta_1
+        self.beta_2 = beta_2
+        self.epsilon = epsilon
+        self.layca = layca
+        self.amsgrad = amsgrad
+
+    def build(self, var_list):
+        """Initialize optimizer variables."""
+        super().build(var_list)
+        if hasattr(self, "_built") and self._built:
+            return
+        self.ms = []
+        self.vs = []
+        if self.amsgrad:
+            self.vhats = []
+        for var in var_list:
+            self.ms.append(
+                self.add_variable_from_reference(
+                    reference_variable=var, name="m"
+                )
+            )
+            self.vs.append(
+                self.add_variable_from_reference(
+                    reference_variable=var, name="v"
+                )
+            )
+            if self.amsgrad:
+                self.vhats.append(
+                    self.add_variable_from_reference(
+                        reference_variable=var, name="vhat"
+                    )
+                )
+
+    def update_step(self, gradient, variable, learning_rate):
+        """One step of Adam."""
+        learning_rate = ops.cast(learning_rate, variable.dtype)
+        gradient = ops.cast(gradient, variable.dtype)
+        
+        # Find corresponding variables
+        m = v = vhat = None
+        for i, var in enumerate(self.variables):
+            if var.name == variable.name:
+                m = self.ms[i]
+                v = self.vs[i]
+                if self.amsgrad:
+                    vhat = self.vhats[i]
+                break
+
+        if m is None or v is None:
+            m = ops.zeros_like(variable)
+            v = ops.zeros_like(variable)
+
+        # Bias correction
+        local_step = ops.cast(self.iterations + 1, variable.dtype)
+        beta_1_power = ops.power(self.beta_1, local_step)
+        beta_2_power = ops.power(self.beta_2, local_step)
+        
+        lr_t = learning_rate * ops.sqrt(1 - beta_2_power) / (1 - beta_1_power)
+
+        # Update moments
+        m_t = self.beta_1 * m + (1. - self.beta_1) * gradient
+        v_t = self.beta_2 * v + (1. - self.beta_2) * ops.square(gradient)
+        
+        self.assign(m, m_t)
+        self.assign(v, v_t)
+
+        if self.amsgrad:
+            vhat_t = ops.maximum(vhat, v_t)
+            self.assign(vhat, vhat_t)
+            step = lr_t * m_t / (ops.sqrt(vhat_t) + self.epsilon)
+        else:
+            step = lr_t * m_t / (ops.sqrt(v_t) + self.epsilon)
+
+        if self.layca:
+            new_p = layca(variable, step, learning_rate)
+        else:
+            new_p = variable - step
+
+        self.assign(variable, new_p)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "beta_1": self.beta_1,
+            "beta_2": self.beta_2,
+            "epsilon": self.epsilon,
+            "amsgrad": self.amsgrad,
+            "layca": self.layca,
+        })
+        return config
 
 class Adagrad(Optimizer):
-    """Adagrad optimizer.
-    It is recommended to leave the parameters of this optimizer
-    at their default values.
-    # Arguments
-        lr: float >= 0. Learning rate.
-        epsilon: float >= 0. If `None`, defaults to `K.epsilon()`.
-        decay: float >= 0. Learning rate decay over each update.
-        layca: boolean, wether to apply layca or not
-    # References
-        - [Adaptive Subgradient Methods for Online Learning and Stochastic Optimization](http://www.jmlr.org/papers/volume12/duchi11a/duchi11a.pdf)
-    """
+    """Adagrad optimizer."""
 
-    def __init__(self, lr=0.01, epsilon=None, decay=0., layca = False,**kwargs):
-        super(Adagrad, self).__init__(**kwargs)
-        with K.name_scope(self.__class__.__name__):
-            self.lr = K.variable(lr, name='lr')
-            self.decay = K.variable(decay, name='decay')
-            self.iterations = K.variable(0, dtype='int64', name='iterations')
-        if epsilon is None:
-            epsilon = K.epsilon()
+    def __init__(self, learning_rate=0.01, epsilon=1e-7, layca=False, **kwargs):
+        super().__init__(learning_rate=learning_rate, **kwargs)
         self.epsilon = epsilon
-        self.initial_decay = decay
-        
         self.layca = layca
 
-    @interfaces.legacy_get_updates_support
-    def get_updates(self, loss, params):
+    def build(self, var_list):
+        """Initialize optimizer variables."""
+        super().build(var_list)
+        if hasattr(self, "_built") and self._built:
+            return
+        self.accumulators = []
+        for var in var_list:
+            self.accumulators.append(
+                self.add_variable_from_reference(
+                    reference_variable=var, name="accumulator"
+                )
+            )
+
+    def update_step(self, gradient, variable, learning_rate):
+        """One step of Adagrad."""
+        learning_rate = ops.cast(learning_rate, variable.dtype)
+        gradient = ops.cast(gradient, variable.dtype)
         
-        grads = self.get_gradients(loss, params)
-        shapes = [K.int_shape(p) for p in params]
-        accumulators = [K.zeros(shape) for shape in shapes]
-        self.weights = accumulators
-        self.updates = [K.update_add(self.iterations, 1)]
+        # Find corresponding accumulator
+        a = None
+        for i, var in enumerate(self.variables):
+            if var.name == variable.name:
+                a = self.accumulators[i]
+                break
 
-        lr = self.lr
-        if self.initial_decay > 0:
-            lr *= (1. / (1. + self.decay * K.cast(self.iterations,
-                                                  K.dtype(self.decay))))
+        if a is None:
+            a = ops.zeros_like(variable)
 
-        for p, g, a in zip(params, grads, accumulators):
-            new_a = a + K.square(g)  # update accumulator
-            self.updates.append(K.update(a, new_a))
-            step = lr * g / (K.sqrt(new_a) + self.epsilon)
-            
-            if self.layca:
-                new_p = layca(p, step, lr)
-            else:
-                new_p =  p - step
-            
-            # Apply constraints.
-            if getattr(p, 'constraint', None) is not None:
-                new_p = p.constraint(new_p)
-
-            self.updates.append(K.update(p, new_p))
-        return self.updates
+        # Update accumulator
+        new_a = a + ops.square(gradient)
+        self.assign(a, new_a)
+        
+        step = learning_rate * gradient / (ops.sqrt(new_a) + self.epsilon)
+        
+        if self.layca:
+            new_p = layca(variable, step, learning_rate)
+        else:
+            new_p = variable - step
+        
+        self.assign(variable, new_p)
 
     def get_config(self):
-        config = {'lr': float(K.get_value(self.lr)),
-                  'decay': float(K.get_value(self.decay)),
-                  'epsilon': self.epsilon,
-                  'layca':self.layca}
-        base_config = super(Adagrad, self).get_config()
-        return dict(list(base_config.items()) + list(config.items()))
+        config = super().get_config()
+        config.update({
+            "epsilon": self.epsilon,
+            "layca": self.layca,
+        })
+        return config

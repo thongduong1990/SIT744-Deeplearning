@@ -19,12 +19,11 @@ def visualize_1stlayer_weights(weights,neuron_indices = None, nb_neurons = 5, ne
         line = i//neurons_per_line
         column = i%neurons_per_line
         
-        # select neuron
-        index = [slice(None)]*len(weights.shape)
-        index[-1] = j
+        # select neuron - weights shape is (784, 784) where each column is a neuron
+        neuron_weights = weights[:, j]
         
         # convert to image
-        kernel = weights[index].reshape((28,28))
+        kernel = neuron_weights.reshape((28,28))
 #         kernel = (kernel - np.min(weights[index])) / np.max(weights[index])
         
         axes[line,column].imshow(kernel, interpolation = 'none')
