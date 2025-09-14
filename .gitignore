@@ -5,7 +5,8 @@ __pycache__/
 
 # C extensions
 *.so
-
+assignment_2/data/*
+assignment_3/emotions/*
 # Distribution / packaging
 .Python
 build/
